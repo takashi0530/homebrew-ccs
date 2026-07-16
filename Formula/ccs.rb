@@ -2,7 +2,7 @@ class Ccs < Formula
   desc "Cross-project session picker & resumer for Claude Code (fzf UI)"
   homepage "https://github.com/takashi0530/homebrew-ccs"
   url "https://github.com/takashi0530/homebrew-ccs/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "d584dd84245b90cf2b12b6285ff43554062ce8d9507ded068d9ad755ffaa3436"
+  sha256 "7b3cf0e47307af9432a472f8082300dac59de8293b2cf308f088c079ccad07ec"
   license "MIT"
 
   depends_on "fzf"
