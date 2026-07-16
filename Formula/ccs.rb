@@ -1,8 +1,8 @@
 class Ccs < Formula
   desc "Cross-project session picker & resumer for Claude Code (fzf UI)"
   homepage "https://github.com/takashi0530/homebrew-ccs"
-  url "https://github.com/takashi0530/homebrew-ccs/archive/refs/tags/v1.0.1.tar.gz"
-  sha256 "b9600b752023b995df835a80683267f4604dea8c55540b3456a8b6177b782474"
+  url "https://github.com/takashi0530/homebrew-ccs/archive/refs/tags/v1.1.0.tar.gz"
+  sha256 "d584dd84245b90cf2b12b6285ff43554062ce8d9507ded068d9ad755ffaa3436"
   license "MIT"
 
   depends_on "fzf"
@@ -13,6 +13,6 @@ class Ccs < Formula
   end
 
   test do
-    assert_match "ccs 1.0.1", shell_output("#{bin}/ccs --version")
+    assert_match "ccs 1.1.0", shell_output("#{bin}/ccs --version")
   end
 end
