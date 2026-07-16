@@ -29,7 +29,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 
 PROJ_DIR="$HOME/.claude/projects"
 HIST="$HOME/.claude/history.jsonl"
@@ -49,9 +49,82 @@ sed_i() {
   if [ "$OS" = Darwin ]; then sed -i '' "$@"; else sed -i "$@"; fi
 }
 
+# 端末の表示幅(列数)を取得する。
+# コマンド置換 $( ) の中では stdout がパイプになり tput cols が実端末幅を
+# 返せない(80等に落ちる)ため、/dev/tty に対して stty size で直接取得する。
+# fzf の reload 内では fzf がエクスポートする FZF_COLUMNS を最優先で使う
+term_cols() {
+  local c=''
+  if is_num "${FZF_COLUMNS:-}" && [ "${FZF_COLUMNS:-0}" -gt 0 ]; then
+    c=$FZF_COLUMNS
+  else
+    c=$(stty size </dev/tty 2>/dev/null | awk '{print $2}')
+    is_num "$c" && [ "$c" -gt 0 ] || c=$(tput cols 2>/dev/null)
+    is_num "$c" && [ "$c" -gt 0 ] || c=120
+  fi
+  echo "$c"
+}
+
 # タブ・制御文字・不正なUTF-8バイトを除去
 # （表示崩れ・フィールド破壊・端末エスケープ注入・awkのマルチバイトエラー対策）
 sanitize() { tr '\t' ' ' | tr -d '\000-\010\013\014\016-\037\177' | iconv -f UTF-8 -t UTF-8 -c; }
+
+# fzf 用の表示行を組み立てる（パスを右端に揃える）。
+# 出力: 表示行 \t 元の8フィールド（cwd/id等の取り出しは cut -f2- で元に戻す）
+# macOS標準awkはマルチバイト非対応のため LC_ALL=C でバイト単位に処理し、
+# UTF-8の先頭バイトから表示幅(日本語=2, ASCII=1)を概算する
+format_fzf() {
+  LC_ALL=C awk -F'\t' -v width="$1" '
+  BEGIN {
+    for (i = 128; i < 256; i++) {
+      b = sprintf("%c", i)
+      if (i >= 224)      W[b] = 2   # 3-4バイトUTF-8の先頭 (日本語・絵文字)
+      else if (i >= 194) W[b] = 1   # 2バイトUTF-8の先頭
+      else               W[b] = 0   # 継続バイト
+    }
+  }
+  function dw(s,   i,c,w) {
+    w = 0
+    for (i = 1; i <= length(s); i++) { c = substr(s,i,1); w += (c in W) ? W[c] : 1 }
+    return w
+  }
+  function trunc(s, maxw,   out,i,c,cw,w) {
+    if (dw(s) <= maxw) return s
+    out = ""; w = 0
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s,i,1); cw = (c in W) ? W[c] : 1
+      # 文字の先頭バイトで幅超過が確定したらそこで打ち切る(継続バイトは幅0で通す)
+      if (cw > 0 && w + cw > maxw - 2) return out "…"
+      w += cw; out = out c
+    }
+    return out
+  }
+  {
+    mtime=$1; named=$2; title=$3; cwd=$4; kb=$5; msgs=$6
+    star = (named == 1) ? "★ " : ""
+    meta = " (" msgs "/" kb ")"
+    fixed = dw(mtime) + 2 + dw(star) + dw(meta)
+    avail = width - fixed - dw(cwd) - 1
+    if (avail < 10) avail = 10
+    t = trunc(title, avail)
+    pad = width - fixed - dw(t) - dw(cwd)
+    if (pad < 1) pad = 1
+    sp = sprintf("%" pad "s", "")
+    if (named == 1)
+      disp = mtime "  \033[1;36m★ " t "\033[0m\033[2m" meta sp cwd "\033[0m"
+    else
+      disp = mtime "  \033[2m" t meta sp cwd "\033[0m"
+    print disp "\t" $0
+  }'
+}
+
+# ── 内部サブコマンド: 行ファイルを現在の端末幅で整形して出力する ──
+# fzf の resize:reload から呼ばれ、リサイズ後の幅に一覧を追従させる
+if [ "${1:-}" = "__fmt" ]; then
+  fmt_src="${2:?__fmt には行ファイルのパスが必要です}"
+  format_fzf "$(( $(term_cols) - 4 ))" < "$fmt_src"
+  exit 0
+fi
 
 # ── 設定読み込み（優先度: 環境変数 > configファイル > デフォルト）──
 # configはsourceせず KEY=VALUE のみ解釈する（任意コード実行を防ぐ）
@@ -340,55 +413,6 @@ if [ -z "$sorted" ]; then
   exit 1
 fi
 
-# fzf 用の表示行を組み立てる（パスを右端に揃える）。
-# 出力: 表示行 \t 元の8フィールド（cwd/id等の取り出しは cut -f2- で元に戻す）
-# macOS標準awkはマルチバイト非対応のため LC_ALL=C でバイト単位に処理し、
-# UTF-8の先頭バイトから表示幅(日本語=2, ASCII=1)を概算する
-format_fzf() {
-  LC_ALL=C awk -F'\t' -v width="$1" '
-  BEGIN {
-    for (i = 128; i < 256; i++) {
-      b = sprintf("%c", i)
-      if (i >= 224)      W[b] = 2   # 3-4バイトUTF-8の先頭 (日本語・絵文字)
-      else if (i >= 194) W[b] = 1   # 2バイトUTF-8の先頭
-      else               W[b] = 0   # 継続バイト
-    }
-  }
-  function dw(s,   i,c,w) {
-    w = 0
-    for (i = 1; i <= length(s); i++) { c = substr(s,i,1); w += (c in W) ? W[c] : 1 }
-    return w
-  }
-  function trunc(s, maxw,   out,i,c,cw,w) {
-    if (dw(s) <= maxw) return s
-    out = ""; w = 0
-    for (i = 1; i <= length(s); i++) {
-      c = substr(s,i,1); cw = (c in W) ? W[c] : 1
-      # 文字の先頭バイトで幅超過が確定したらそこで打ち切る(継続バイトは幅0で通す)
-      if (cw > 0 && w + cw > maxw - 2) return out "…"
-      w += cw; out = out c
-    }
-    return out
-  }
-  {
-    mtime=$1; named=$2; title=$3; cwd=$4; kb=$5; msgs=$6
-    star = (named == 1) ? "★ " : ""
-    meta = " (" msgs "/" kb ")"
-    fixed = dw(mtime) + 2 + dw(star) + dw(meta)
-    avail = width - fixed - dw(cwd) - 1
-    if (avail < 10) avail = 10
-    t = trunc(title, avail)
-    pad = width - fixed - dw(t) - dw(cwd)
-    if (pad < 1) pad = 1
-    sp = sprintf("%" pad "s", "")
-    if (named == 1)
-      disp = mtime "  \033[1;36m★ " t "\033[0m\033[2m" meta sp cwd "\033[0m"
-    else
-      disp = mtime "  \033[2m" t meta sp cwd "\033[0m"
-    print disp "\t" $0
-  }'
-}
-
 print_list() {
   local i=0
   while IFS=$'\t' read -r mtime named title cwd kb msgs id file; do
@@ -437,6 +461,8 @@ resume_session() {
   fi
   flags=$(mode_flags "$m")
   echo "→ cd $cwd && claude --resume $id ${flags:-(通常モード)}"
+  # exec すると EXIT trap が走らないため、整形用一時ファイルはここで消す
+  [ -n "${fmt_tmp:-}" ] && rm -f "$fmt_tmp"
   # shellcheck disable=SC2086
   cd "$cwd" && exec claude --resume "$id" $flags
 }
@@ -460,9 +486,18 @@ fi
 [ -n "$trunc_note" ] && header="$header  $trunc_note"
 
 if command -v fzf >/dev/null 2>&1; then
-  # 表示行は1列に整形済み(パス右寄せ)。元フィールドは2列目以降に温存
-  list_width=$(( $(tput cols 2>/dev/null || echo 120) - 4 ))
-  out=$(printf '%s\n' "$sorted" | format_fzf "$list_width" | fzf \
+  # 表示行は1列に整形済み(パス右寄せ)。元フィールドは2列目以降に温存。
+  # 元データを一時ファイルに置き、端末リサイズ時は resize イベントで
+  # __fmt を reload して新しい幅に整形し直す (resize イベントは fzf 0.46+)
+  fmt_tmp=$(mktemp "${TMPDIR:-/tmp}/ccs-rows.XXXXXX")
+  trap 'rm -f "$fmt_tmp"' EXIT
+  printf '%s\n' "$sorted" > "$fmt_tmp"
+  resize_bind=()
+  fzf_minor=$(fzf --version 2>/dev/null | sed -nE 's/^0\.([0-9]+).*/\1/p')
+  if is_num "$fzf_minor" && [ "$fzf_minor" -ge 46 ]; then
+    resize_bind=(--bind "resize:reload($(printf '%q' "$0") __fmt $(printf '%q' "$fmt_tmp"))")
+  fi
+  out=$("$0" __fmt "$fmt_tmp" | fzf \
     --ansi \
     --delimiter=$'\t' --with-nth=1 \
     --query="$kw" \
@@ -470,7 +505,8 @@ if command -v fzf >/dev/null 2>&1; then
     --height=~60% --layout=reverse --info=inline \
     --header="$header" \
     --preview="$preview" \
-    --preview-window=down,35%,wrap)
+    --preview-window=down,35%,wrap \
+    ${resize_bind[@]+"${resize_bind[@]}"})
   rc=$?
   case "$rc" in
     0) ;;
