@@ -9,6 +9,7 @@
 #   ccs --days N         直近N日のセッションだけ表示
 #   ccs --cwd            今いるディレクトリ(配下/親)のセッションだけ表示
 #   ccs backup           全セッションをバックアップ（自動削除対策）
+#   ccs cache [clear]    走査結果キャッシュの状態表示 / 削除（表示がおかしいときの初期化用）
 #   ccs -m <mode>        権限モードを指定して再開 (normal / auto / skip)
 #   ccs -h               ヘルプ
 #
@@ -25,11 +26,13 @@
 #   CCS_BACKUP_DIR=~/.claude-session-backups
 #
 # 表示: ★シアン=名前付き(/rename済み) / グレー=無名(最初のプロンプトを表示)
+# 速度: ファイルごとの走査結果を ~/.cache/ccs/index.tsv に保存し、変更のないセッションは
+#       再走査しない（追記だけなら追記分のみ走査）。初回だけ全件走査で時間がかかる
 # 注意: ~/.claude/projects/ の内部仕様(非公式)に依存。Claude Code更新で壊れる可能性あり。
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 PROJ_DIR="$HOME/.claude/projects"
 HIST="$HOME/.claude/history.jsonl"
@@ -39,8 +42,8 @@ is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 # ── OS差分の吸収 (macOS=BSD / Linux=GNU) ──
 OS=$(uname -s)
-file_meta() {  # 出力: "サイズ(bytes) エポック秒"
-  if [ "$OS" = Darwin ]; then stat -f '%z %m' "$1"; else stat -c '%s %Y' "$1"; fi
+stat_all() {  # 出力: "サイズ(bytes) エポック秒 パス" を引数のファイルごとに1行
+  if [ "$OS" = Darwin ]; then stat -f '%z %m %N' "$@"; else stat -c '%s %Y %n' "$@"; fi
 }
 fmt_epoch() {  # エポック秒 → "YYYY-MM-DD HH:MM"
   if [ "$OS" = Darwin ]; then date -r "$1" '+%Y-%m-%d %H:%M'; else date -d "@$1" '+%Y-%m-%d %H:%M'; fi
@@ -177,6 +180,7 @@ ${Y}絞り込みオプション${R}
 ${Y}その他${R}
   ${C}-m normal|auto|skip${R}  権限モードを先に指定して開く
   ${C}ccs backup${R}           全セッションを退避（自動削除対策）
+  ${C}ccs cache clear${R}      走査キャッシュを削除（表示がおかしいときに。次回は全件再走査）
   ${C}ccs config${R}           設定の表示 / ${C}ccs config max 200${R} で変更 / ${C}ccs config edit${R} で編集
   ${C}ccs help${R} / ${C}-h${R}       このヘルプ
 
@@ -287,6 +291,23 @@ CCS_BACKUP_DIR=$HOME/.claude-session-backups
 EOF
 }
 
+# ── cache サブコマンド ──
+cache_cmd() {
+  local file="${XDG_CACHE_HOME:-$HOME/.cache}/ccs/index.tsv"
+  case "${1:-}" in
+    '')
+      if [ -f "$file" ]; then
+        echo "キャッシュ: $file ($(( $(wc -l < "$file") - 1 )) 件, $(du -h "$file" | cut -f1))"
+      else
+        echo "キャッシュ: $file (未作成)"
+      fi
+      echo "削除: ccs cache clear" ;;
+    clear) rm -f "$file"; echo "削除しました: $file (次回は全件を走査し直します)" ;;
+    *) echo "不明なサブコマンド: cache $1 (clear のみ)" >&2; exit 1 ;;
+  esac
+  exit 0
+}
+
 # ── 引数パース ──
 list_only=false; grep_kw=''; days=0; cwd_only=false; kw=''; mode=''
 while [ $# -gt 0 ]; do
@@ -294,6 +315,7 @@ while [ $# -gt 0 ]; do
     -h|--help|help) print_help; exit 0 ;;
     -v|--version) echo "ccs $VERSION"; exit 0 ;;
     config|-config|--config) shift; config_cmd "$@" ;;
+    cache)     shift; cache_cmd "$@" ;;
     -l|--list) list_only=true ;;
     -g|--grep) shift; grep_kw="${1:?-g にはキーワードが必要です}" ;;
     --days)    shift; days="${1:?--days には日数が必要です}"
@@ -336,66 +358,151 @@ fi
 target_files=("$PROJ_DIR"/*/*.jsonl)
 if [ -n "$grep_kw" ]; then
   matched=$(grep -liF -- "$grep_kw" "$PROJ_DIR"/*/*.jsonl 2>/dev/null || true)
-  [ -z "$matched" ] && { echo "本文に「$grep_kw」を含むセッションはありません。" >&2; exit 1; }
+  [ -z "$matched" ] && { echo "本文に「${grep_kw}」を含むセッションはありません。" >&2; exit 1; }
   target_files=()
   while IFS= read -r _f; do target_files+=("$_f"); done <<< "$matched"
 fi
 
 now=$(date +%s)
 
-# 無名セッションのラベル用に history.jsonl を一度だけパースしておく
+# 無名セッションのラベル用に history.jsonl をパースする（未走査ファイルがあるときだけ1回）
 # (@tsv がタブ・改行を \t \n にエスケープするのでフィールド破壊も防げる)
-hist_titles=''
-if [ -f "$HIST" ]; then
+hist_titles=''; hist_loaded=0
+load_hist_titles() {  # 親シェルで呼ぶこと（$( ) 内で呼ぶと結果が残らない）
+  [ "$hist_loaded" = 0 ] || return 0
+  hist_loaded=1
+  [ -f "$HIST" ] || return 0
   hist_titles=$(jq -r 'select(.display and .sessionId) | [.sessionId, .display] | @tsv' "$HIST" 2>/dev/null \
     | awk -F'\t' '$2 !~ /^\// && !seen[$1]++ {print}' || true)
-fi
+}
+hist_title() {  # $1=セッションID → history.jsonl 上の最初のプロンプト
+  [ -n "$hist_titles" ] || return 0
+  # cut -c はバイト単位でマルチバイト文字を壊すため、切ってから sanitize で修復
+  printf '%s\n' "$hist_titles" | grep -m1 "^$1"$'\t' | cut -f2- \
+    | sed 's/\\[tnr]/ /g' | cut -c1-180 | sanitize
+}
+
+# ── インデックスキャッシュ ──
+# ファイルごとの集計結果(cwd / タイトル / 発言数)を size+mtime をキーに保存し、変更の
+# ないファイルは再走査しない(過去セッションは二度と読まない)。ファイルが末尾追記だけで
+# 育っている場合(サイズ増加 かつ 旧末尾4KBのmd5一致)は追記分だけ走査する。
+# 行: path size epoch 日時 cwd named title msgs tailmd5   (tailmd5 "-" = 増分走査不可)
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ccs"
+CACHE="$CACHE_DIR/index.tsv"
+CACHE_HEADER='#ccs-index-v1'
+
+md5_cmd() { if [ "$OS" = Darwin ]; then md5 -q; else md5sum | cut -d' ' -f1; fi; }
+# $1=ファイル $2=開始バイト位置 → そこから末尾までを出力。
+# BSD tail は出力が遅い(約50MB/s)ため dd のブロック skip で読む(4KB境界までは bs=1)
+read_from() {
+  local head_n=$(( 4096 - $2 % 4096 ))
+  [ "$head_n" = 4096 ] && head_n=0
+  [ "$head_n" -gt 0 ] && dd if="$1" bs=1 skip="$2" count="$head_n" 2>/dev/null
+  dd if="$1" bs=4096 skip=$(( ($2 + head_n) / 4096 )) 2>/dev/null
+}
+read_range() { read_from "$1" "$2" | head -c $(( $3 - $2 )); }  # $1=ファイル [$2,$3) バイト
+sample_md5() {  # $1=ファイル $2=末尾位置 → その位置までの最後4KBのmd5
+  local start=$(( $2 - 4096 )); [ "$start" -lt 0 ] && start=0
+  read_range "$1" "$start" "$2" | md5_cmd
+}
+count_user_msgs() {  # stdin → ユーザー発言数（メタ行・ツール実行結果を除く）
+  grep '"type":"user"' | grep -v '"isMeta":true' | grep -vc '"type":"tool_result"' || true
+}
+last_custom_title() { grep -o '"customTitle":"[^"]*"' | tail -1 | cut -d'"' -f4 | sanitize; }  # stdin
+
+# 1ファイルを走査して cwd / named / title / msgs / tailmd5 / mtime を設定する。
+# 引数: ファイル 現サイズ 旧サイズ 旧tailmd5 (旧値は増分走査の判定用。キャッシュ無しなら空)
+# 増分走査時は cwd / named / title / msgs に読み込み済みのキャッシュ値が入っている前提
+scan_session() {
+  local f=$1 size=$2 csize=${3:-} old_md5=${4:-} off=0 new_title new_msgs
+  if [ -n "$csize" ] && [ "$csize" -gt 0 ] && [ "$size" -gt "$csize" ] \
+     && [ -n "$old_md5" ] && [ "$old_md5" != '-' ] \
+     && [ "$(sample_md5 "$f" "$csize")" = "$old_md5" ]; then
+    off=$csize
+  fi
+  mtime=$(fmt_epoch "$epoch")
+  [ -n "${CCS_DEBUG:-}" ] && echo "[ccs] scan $([ "$off" -gt 0 ] && echo "incr@$off" || echo full) $f" >&2
+  if [ "$off" -gt 0 ]; then
+    new_title=$(read_from "$f" "$off" | last_custom_title)
+    new_msgs=$(read_from "$f" "$off" | count_user_msgs)
+    msgs=$(( msgs + new_msgs ))
+    if [ -n "$new_title" ]; then named=1; title=$new_title; fi
+  else
+    cwd=$(grep -m1 -o '"cwd":"[^"]*"' "$f" | cut -d'"' -f4)
+    [ -z "$cwd" ] && cwd="(不明)"
+    msgs=$(count_user_msgs < "$f")
+    named=1
+    title=$(last_custom_title < "$f")
+    if [ -z "$title" ]; then named=0; title=$(hist_title "$id"); fi
+    [ -z "$title" ] && title="(無題)"
+  fi
+  # 次回の増分走査を許すのは「走査中にファイルが育っておらず」かつ「末尾が改行」のとき。
+  # (走査は現在の末尾まで読むので、育っていたら stat 時点のサイズと整合しない)
+  local size2 epoch2
+  read -r size2 epoch2 _ <<< "$(stat_all "$f" 2>/dev/null)"
+  if [ "$size2" = "$size" ] && [ "$epoch2" = "$epoch" ] && [ "$size" -gt 0 ] \
+     && [ -z "$(read_range "$f" $(( size - 1 )) "$size")" ]; then
+    tailmd5=$(sample_md5 "$f" "$size")
+  else
+    tailmd5='-'
+  fi
+}
+
+title_excluded() {  # $1=タイトル → CCS_EXCLUDE に大文字小文字無視で一致すれば真
+  shopt -s nocasematch; [[ $1 =~ $CCS_EXCLUDE ]]; local rc=$?; shopt -u nocasematch; return $rc
+}
+
+# 対象ファイルの stat 一覧とキャッシュを突き合わせ、行種別付きで出力する
+#   H: 変更なし(キャッシュ行そのまま)  M: 要走査(末尾に旧サイズ)  K: 今回対象外(温存候補)
+mkdir -p "$CACHE_DIR"
+[ -f "$CACHE" ] && [ "$(head -1 "$CACHE")" = "$CACHE_HEADER" ] || printf '%s\n' "$CACHE_HEADER" > "$CACHE"
+stat_tmp=$(mktemp "$CACHE_DIR/index.XXXXXX")
+trap 'rm -f "$stat_tmp"' EXIT  # 走査中に中断されても一時ファイルを残さない(書き戻し後は無害)
+stat_all ${target_files[@]+"${target_files[@]}"} 2>/dev/null > "$stat_tmp"
+join_cache() {
+  awk -v OFS='\t' '
+    NR==FNR { if (FNR==1) next; split($0, f, "\t"); c[f[1]]=$0; sz[f[1]]=f[2]; ep[f[1]]=f[3]; next }
+    { size=$1; epoch=$2; path=substr($0, length($1)+length($2)+3); seen[path]=1
+      if (!(path in c)) { print "M", path, size, epoch; next }
+      if (sz[path]==size && ep[path]==epoch) { print "H", c[path]; next }
+      row=c[path]; sub(/^[^\t]*\t[^\t]*\t[^\t]*\t/, "", row)
+      print "M", path, size, epoch, row, sz[path] }
+    END { for (p in c) if (!(p in seen)) print "K", c[p] }
+  ' "$CACHE" "$stat_tmp"
+}
 
 # ── セッション情報の収集 ──
 # フィールド: epoch \t 日時 \t 名前付き \t タイトル \t cwd \t サイズ \t 発言数 \t id \t ファイル
-rows=""
-for f in ${target_files[@]+"${target_files[@]}"}; do
-  [ -e "$f" ] || continue
-  id=$(basename "$f" .jsonl)
-  read -r size epoch <<< "$(file_meta "$f")"
-  mtime=$(fmt_epoch "$epoch")
-  kb=$(( size / 1024 ))
-  if [ "$days" -gt 0 ]; then
-    [ "$epoch" -lt $(( now - days * 86400 )) ] && continue
+rows=""; cache_new=""
+while IFS=$'\t' read -r kind f size epoch mtime cwd named title msgs tailmd5 csize; do
+  if [ "$kind" = K ]; then
+    [ -e "$f" ] && cache_new+="${f}"$'\t'"${size}"$'\t'"${epoch}"$'\t'"${mtime}"$'\t'"${cwd}"$'\t'"${named}"$'\t'"${title}"$'\t'"${msgs}"$'\t'"${tailmd5}"$'\n'
+    continue
   fi
+  id=${f##*/}; id=${id%.jsonl}
+  if [ "$days" -gt 0 ] && [ "$epoch" -lt $(( now - days * 86400 )) ]; then
+    [ "$kind" = M ] && continue  # 走査せず、キャッシュにも残さない
+    cache_new+="${f}"$'\t'"${size}"$'\t'"${epoch}"$'\t'"${mtime}"$'\t'"${cwd}"$'\t'"${named}"$'\t'"${title}"$'\t'"${msgs}"$'\t'"${tailmd5}"$'\n'
+    continue
+  fi
+  if [ "$kind" = M ]; then load_hist_titles; scan_session "$f" "$size" "$csize" "$tailmd5"; fi
+  cache_new+="${f}"$'\t'"${size}"$'\t'"${epoch}"$'\t'"${mtime}"$'\t'"${cwd}"$'\t'"${named}"$'\t'"${title}"$'\t'"${msgs}"$'\t'"${tailmd5}"$'\n'
 
-  cwd=$(grep -m1 -o '"cwd":"[^"]*"' "$f" | cut -d'"' -f4)
-  [ -z "$cwd" ] && cwd="(不明)"
   if $cwd_only; then
     case "$cwd" in "$PWD"|"$PWD"/*) : ;; *) case "$PWD" in "$cwd"|"$cwd"/*) : ;; *) continue ;; esac ;; esac
   fi
-
-  # ユーザー発言数（メタ行・ツール実行結果を除く）
-  msgs=$(grep '"type":"user"' "$f" | grep -v '"isMeta":true' | grep -vc '"type":"tool_result"' || true)
-
-  named=1
-  title=$(grep -o '"customTitle":"[^"]*"' "$f" | tail -1 | cut -d'"' -f4 | sanitize)
-  if [ -z "$title" ]; then
-    named=0
-    if [ -n "$hist_titles" ]; then
-      # cut -c はバイト単位でマルチバイト文字を壊すため、切ってから sanitize で修復
-      title=$(printf '%s\n' "$hist_titles" | grep -m1 "^$id"$'\t' | cut -f2- \
-        | sed 's/\\[tnr]/ /g' | cut -c1-180 | sanitize)
-    fi
-  fi
-  [ -z "$title" ] && title="(無題)"
-
+  kb=$(( size / 1024 ))
   # サイズ・発言数フィルタは無名セッションのみに適用（/rename済みは常に表示）
   if [ "$named" = 0 ]; then
     [ "$kb" -lt "$CCS_MIN_KB" ] && continue
     [ "$msgs" -lt "$CCS_MIN_MSGS" ] && continue
   fi
-  if [ -n "$CCS_EXCLUDE" ] && printf '%s' "$title" | grep -qiE -- "$CCS_EXCLUDE"; then
-    continue
-  fi
+  [ -n "$CCS_EXCLUDE" ] && title_excluded "$title" && continue
 
   rows+="${epoch}"$'\t'"${mtime}"$'\t'"${named}"$'\t'"${title}"$'\t'"${cwd/#$HOME/~}"$'\t'"${kb}KB"$'\t'"${msgs}msg"$'\t'"${id}"$'\t'"${f}"$'\n'
-done
+done < <(join_cache)
+# キャッシュを書き戻す（一時ファイル経由で差し替え）
+{ printf '%s\n' "$CACHE_HEADER"; printf '%s' "$cache_new"; } > "$stat_tmp" && mv -f "$stat_tmp" "$CACHE"
 
 total=$(printf '%s' "$rows" | wc -l | tr -d ' ')
 # 新しい順に並べる。件数上限(CCS_MAX)は無名セッションのみに適用し、
@@ -478,7 +585,7 @@ if [ -n "$grep_kw" ]; then
   done
   export CCS_Q_RE
   preview='echo "ID: {8}  DIR: {5}"; echo "── ヒット箇所 ──"; grep -o -i ".\{0,60\}$CCS_Q_RE.\{0,60\}" {9} | tr -d '\''\000-\010\013\014\016-\037\177'\'' | head -12'
-  header="本文検索「$grep_kw」/ Enter=通常 / C-a=auto / C-x=dangerous-skip / Esc=中止 (★=名前付き)"
+  header="本文検索「${grep_kw}」/ Enter=通常 / C-a=auto / C-x=dangerous-skip / Esc=中止 (★=名前付き)"
 else
   preview='echo "ID: {8}  DIR: {5}"; echo "── 直近のユーザー発言 ──"; tail -n 500 {9} | jq -r '\''select(.type=="user" and .isMeta!=true) | .message.content | if type=="string" then . else ([.[] | select(.type=="text") | .text] | join(" ")) end'\'' 2>/dev/null | tr -d '\''\000-\010\013\014\016-\037\177'\'' | grep -v "^[[:space:]]*$" | cut -c1-200 | iconv -f UTF-8 -t UTF-8 -c | tail -12'
   header='↑↓選択+絞り込み / Enter=通常で再開 / C-a=auto / C-x=dangerous-skip / Esc=中止 (★=名前付き)'
