@@ -22,6 +22,7 @@ $ ccs
 - **Resume with a permission mode** — `Enter` = normal, `Ctrl-A` = `--permission-mode acceptEdits`, `Ctrl-X` = `--dangerously-skip-permissions`
 - **Backup** — `ccs backup` copies all session files out of reach of Claude Code's automatic cleanup (30 days by default)
 - **Noise filtering** — hide tiny/abandoned unnamed sessions via config
+- **Fast on large histories** — per-session scan results are cached in `~/.cache/ccs/index.tsv`; unchanged transcripts are never re-read, and a growing one is scanned incrementally (append-only). Only the very first run (or after `ccs cache clear`) reads everything
 - Works without fzf too (falls back to a numbered menu)
 
 ## Install
@@ -53,6 +54,7 @@ ccs --days 7       # sessions from the last 7 days
 ccs --cwd          # sessions related to the current directory
 ccs -m skip        # resume with --dangerously-skip-permissions
 ccs backup         # snapshot all sessions to ~/.claude-session-backups
+ccs cache clear    # drop the scan cache (next run re-reads everything)
 ccs config         # interactive settings (or: ccs config max 200 / ccs config edit)
 ccs help           # full help
 ```
@@ -81,7 +83,7 @@ Filters apply to **unnamed** sessions only — anything you `/rename` inside Cla
 
 ## Caveats
 
-- `ccs` reads Claude Code's **undocumented internal files** (`~/.claude/projects/**/*.jsonl`, `~/.claude/history.jsonl`). A Claude Code update may break it at any time. It only ever *reads* session data (plus a copy for `backup`), so it cannot corrupt your history.
+- `ccs` reads Claude Code's **undocumented internal files** (`~/.claude/projects/**/*.jsonl`, `~/.claude/history.jsonl`). A Claude Code update may break it at any time. It only ever *reads* session data (plus a copy for `backup`), so it cannot corrupt your history. The only file it writes on its own is the scan cache under `~/.cache/ccs/` (`$XDG_CACHE_HOME` is honored).
 - Recent Claude Code builds have `Ctrl-A` inside `/resume` to widen the picker to all projects; `ccs` still adds full-text search, permission-mode selection, filtering, and backup on top.
 - UI messages are currently Japanese. PRs for i18n are welcome.
 
@@ -101,6 +103,7 @@ Claude Code はセッションを「claude を起動したディレクトリ」�
 - **権限モードを選んで再開** — `Enter` = 通常 / `Ctrl-A` = 編集自動許可 / `Ctrl-X` = dangerously-skip
 - **バックアップ** — `ccs backup` で自動削除（既定30日）に備えて全セッションを退避
 - **ノイズ除去** — 「あ」だけ打って放置したような無名セッションを設定で非表示にできる
+- **履歴が肥大化しても速い** — セッションごとの走査結果を `~/.cache/ccs/index.tsv` に保存し、変更のないファイルは再読込しない。追記で育っているセッションは追記分だけ走査。全件を読むのは初回（と `ccs cache clear` の後）だけ
 - fzf がない環境では番号選択メニューに自動フォールバック
 
 ## インストール
@@ -132,6 +135,7 @@ ccs --days 7       # 直近7日のセッションのみ
 ccs --cwd          # 今いるディレクトリに関係するもののみ
 ccs -m skip        # dangerously-skip-permissions で再開
 ccs backup         # 全セッションを ~/.claude-session-backups に退避
+ccs cache clear    # 走査キャッシュを削除（次回は全件を読み直す）
 ccs config         # 設定（対話式。ccs config max 200 の一発指定や ccs config edit も可）
 ccs help           # ヘルプ
 ```
@@ -160,7 +164,7 @@ ccs help           # ヘルプ
 
 ## 注意事項
 
-- `ccs` は Claude Code の**非公式な内部ファイル**（`~/.claude/projects/**/*.jsonl` 等）を読んでいます。Claude Code の更新で動かなくなる可能性があります。セッションデータへの書き込みは一切しない（backup のコピーを除く）ので、履歴を壊すことはありません。
+- `ccs` は Claude Code の**非公式な内部ファイル**（`~/.claude/projects/**/*.jsonl` 等）を読んでいます。Claude Code の更新で動かなくなる可能性があります。セッションデータへの書き込みは一切しない（backup のコピーを除く）ので、履歴を壊すことはありません。自前で書くのは `~/.cache/ccs/` 配下の走査キャッシュだけです（`$XDG_CACHE_HOME` に従います）。
 - 最近の Claude Code には `/resume` 画面で `Ctrl-A` を押すと全プロジェクトに広げる機能があります。`ccs` はその上に全文検索・権限モード選択・フィルタ・バックアップを足したものです。
 
 ## License
